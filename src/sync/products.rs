@@ -5,11 +5,11 @@ use nestify::nest;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::{fs, io::AsyncWriteExt};
-use toml_edit::Array;
+use toml_edit::{Array, Item, Table, Value};
 
 use crate::utils::{deserialize_regex_vec, serialize_regex_vec};
 use crate::{
-    Result, get_toml_value,
+    Result,
     ui::diffs::{DiffChange, ProductDiff, ProductDiffs},
 };
 
@@ -87,23 +87,15 @@ impl VCSProducts {
             toml_products = toml_edit::DocumentMut::new();
         }
 
-        let mut metadata = get_toml_value!(toml_products, "metadata");
-        let mut gamepasses = get_toml_value!(toml_products, "gamepasses");
-        let mut products = get_toml_value!(toml_products, "products");
+        let metadata = section(&mut toml_products, "metadata");
 
-        if let Some(discount_prefix) = &self.metadata.discount_prefix {
-            metadata["discount-prefix"] = toml_edit::value(discount_prefix.clone());
-        } else {
-            metadata.remove("discount-prefix");
-        }
-
-        metadata["universe-id"] = toml_edit::value(self.metadata.universe_id as i64);
-
-        if let Some(luau_file) = &self.metadata.luau_file {
-            metadata["luau-file"] = toml_edit::value(luau_file);
-        } else {
-            metadata.remove("luau-file");
-        }
+        set_or_remove(
+            metadata,
+            "discount-prefix",
+            self.metadata.discount_prefix.clone(),
+        );
+        set_value(metadata, "universe-id", self.metadata.universe_id as i64);
+        set_or_remove(metadata, "luau-file", self.metadata.luau_file.clone());
 
         let filters = self
             .metadata
@@ -114,18 +106,17 @@ impl VCSProducts {
             .map(|x| x.as_str().to_string())
             .collect::<Vec<_>>();
 
-        metadata["name-filters"] = toml_edit::value(Array::from_iter(filters.iter()));
+        set_value(metadata, "name-filters", Array::from_iter(filters.iter()));
 
-        for gamepass in &self.gamepasses {
-            gamepasses[&gamepass.0] = gamepass.1.into();
-        }
-        for product in &self.products {
-            products[&product.0] = product.1.into();
+        let gamepasses = section(&mut toml_products, "gamepasses");
+        for (key, gamepass) in &self.gamepasses {
+            update_product_table(gamepasses, key, gamepass);
         }
 
-        toml_products["metadata"] = toml_edit::Item::Table(metadata);
-        toml_products["gamepasses"] = toml_edit::Item::Table(gamepasses);
-        toml_products["products"] = toml_edit::Item::Table(products);
+        let products = section(&mut toml_products, "products");
+        for (key, product) in &self.products {
+            update_product_table(products, key, product);
+        }
 
         fs::write("products.toml", toml_products.to_string()).await?;
         Ok(())
@@ -260,36 +251,63 @@ impl Product {
     }
 }
 
-impl From<&Product> for toml_edit::Item {
+impl Product {
+    fn apply_to_table(&self, table: &mut Table) {
+        set_or_remove(table, "id", self.id.map(|id| id as i64));
+        set_or_remove(table, "prefix", self.prefix.clone());
+        set_value(table, "name", self.name.clone());
+        set_or_remove(table, "description", self.description.clone());
+        set_value(table, "active", self.active);
+        set_or_remove(table, "discount", self.discount.map(|d| d as i64));
+        set_value(table, "price", self.price);
+        set_or_remove(table, "regional-pricing", self.regional_pricing);
+    }
+}
+
+impl From<&Product> for Item {
     fn from(prod: &Product) -> Self {
-        let mut table = toml_edit::Table::new();
+        let mut table = Table::new();
+        prod.apply_to_table(&mut table);
+        Item::Table(table)
+    }
+}
 
-        if let Some(id) = prod.id {
-            table["id"] = toml_edit::value(id as i64);
+fn section<'a>(doc: &'a mut toml_edit::DocumentMut, name: &str) -> &'a mut Table {
+    let item = doc.entry(name).or_insert_with(|| Item::Table(Table::new()));
+    if !item.is_table() {
+        *item = Item::Table(Table::new());
+    }
+    item.as_table_mut()
+        .expect("item was just ensured to be a table")
+}
+
+fn set_value<V: Into<Value>>(table: &mut Table, key: &str, value: V) {
+    let existing_decor = table
+        .get(key)
+        .and_then(Item::as_value)
+        .map(|v| v.decor().clone());
+
+    table[key] = toml_edit::value(value);
+
+    if let Some(decor) = existing_decor
+        && let Some(new_value) = table[key].as_value_mut()
+    {
+        *new_value.decor_mut() = decor;
+    }
+}
+
+fn set_or_remove<V: Into<Value>>(table: &mut Table, key: &str, value: Option<V>) {
+    match value {
+        Some(value) => set_value(table, key, value),
+        None => {
+            table.remove(key);
         }
+    }
+}
 
-        if let Some(prefix) = &prod.prefix {
-            table["prefix"] = toml_edit::value(prefix.clone());
-        }
-
-        table["name"] = toml_edit::value(&prod.name);
-
-        if let Some(desc) = &prod.description {
-            table["description"] = toml_edit::value(desc);
-        }
-
-        table["active"] = toml_edit::value(prod.active);
-
-        if let Some(discount) = prod.discount {
-            table["discount"] = toml_edit::value(discount as i64);
-        }
-
-        table["price"] = toml_edit::value(prod.price);
-
-        if let Some(regional_pricing) = prod.regional_pricing {
-            table["regional-pricing"] = toml_edit::value(regional_pricing);
-        }
-
-        toml_edit::Item::Table(table)
+fn update_product_table(table: &mut Table, key: &str, product: &Product) {
+    match table.get_mut(key).and_then(Item::as_table_mut) {
+        Some(existing) => product.apply_to_table(existing),
+        None => table[key] = product.into(),
     }
 }
